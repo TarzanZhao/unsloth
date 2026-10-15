@@ -32,7 +32,14 @@ import {
   InformationCircleIcon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { Streamdown } from "streamdown";
 import { loadCodingAgents } from "../api/coding-agents";
 import type {
@@ -56,6 +63,11 @@ import {
   statusGgufVerdict,
 } from "./agent-command";
 import { keylessBaseEligible } from "./keyless-example-eligibility";
+import {
+  readUseTunnelPref,
+  subscribeUseTunnelPref,
+  writeUseTunnelPref,
+} from "./tunnel-preference";
 
 type ExampleType =
   | "curl"
@@ -128,22 +140,37 @@ const ADV = {
 const DOC_LINKS = [
   { label: "Claude Code", href: "https://unsloth.ai/docs/basics/claude-code" },
   { label: "Codex", href: "https://unsloth.ai/docs/basics/codex" },
-  { label: "OpenClaw", href: "https://unsloth.ai/docs/integrations/openclaw" },
-  { label: "OpenCode", href: "https://unsloth.ai/docs/integrations/opencode" },
   {
-    label: "Hermes Agent",
-    href: "https://unsloth.ai/docs/integrations/hermes-agent",
+    label: "VS Code",
+    href: "https://code.visualstudio.com/docs/copilot/customization/language-models",
   },
   {
     label: "DeepSeek Harness",
     href: "https://github.com/deepseek-ai/deepseek-harness",
   },
+  { label: "OpenCode", href: "https://unsloth.ai/docs/integrations/opencode" },
+  {
+    label: "Hermes Agent",
+    href: "https://unsloth.ai/docs/integrations/hermes-agent",
+  },
+  { label: "OpenClaw", href: "https://unsloth.ai/docs/integrations/openclaw" },
+  { label: "Pi", href: "https://pi.dev" },
+  { label: "Mistral Vibe", href: "https://github.com/mistralai/mistral-vibe" },
 ];
 
-// Fallback until the backend's installed-CLI check resolves. Mirrors
-// CODING_AGENTS in studio/backend/utils/coding_agents.py, minus HIDDEN_AGENTS
-// (see ../api/coding-agents.ts).
-const DEFAULT_AGENTS = ["claude", "codex", "openclaw", "opencode", "hermes", "dsh"];
+// Fallback until the backend's installed-CLI check resolves. Mirrors CODING_AGENTS in
+// studio/backend/utils/coding_agents.py.
+const DEFAULT_AGENTS = [
+  "claude",
+  "codex",
+  "vscode",
+  "dsh",
+  "opencode",
+  "hermes",
+  "openclaw",
+  "pi",
+  "vibe",
+];
 // The agent selection resets to this whenever an auto-pick is no longer
 // trustworthy (leaving loopback, or the only compatible detected agent
 // stops being compatible) rather than lingering on a stale choice.
@@ -151,10 +178,13 @@ const DEFAULT_AGENT = "claude";
 const AGENT_LABELS: Record<string, string> = {
   claude: "Claude Code",
   codex: "Codex",
-  openclaw: "OpenClaw",
+  vscode: "VS Code",
+  dsh: "DeepSeek Harness",
   opencode: "OpenCode",
   hermes: "Hermes",
-  dsh: "DeepSeek Harness",
+  openclaw: "OpenClaw",
+  pi: "Pi",
+  vibe: "Mistral Vibe",
 };
 
 const j = (s: string): string => JSON.stringify(s);
@@ -174,9 +204,8 @@ function bodyExtraLines(variant: Variant, indent: string): string[] {
   if (variant !== "plain") {
     lines.push(`${indent}"enable_tools": true,`);
     lines.push(`${indent}"enabled_tools": [${toolsJson}],`);
-    // The gate only asks over the X-Unsloth-Events frames these snippets deliberately do
-    // not take, so say the tools run unprompted rather than hand out a request the server
-    // refuses.
+    // The gate only asks over the X-Unsloth-Events frames these snippets deliberately do not take,
+    // so say the tools run unprompted rather than hand out a request the server refuses.
     lines.push(`${indent}"permission_mode": "off",`);
   }
   return lines;
@@ -368,34 +397,24 @@ function buildSnippets(
 }
 
 const KEY_PLACEHOLDER = "sk-unsloth-YOUR_KEY";
-// the openai sdks require some api_key, so name one rather than leave it blank
+// OpenAI SDKs require an api_key value even for keyless access.
 const KEYLESS_KEY_PLACEHOLDER = "not-needed";
-const USE_TUNNEL_KEY = "unsloth_api_use_tunnel";
-// Slow retry while /v1 has nothing to name: a download or load moves no store state.
+// retry while /v1 has no model because downloads and loads do not update the store.
 const CATALOG_RETRY_MS = 15000;
-// Slower beat once something is servable: an idle unload frees a model without
-// touching the store, so residency is never settled for good.
+// keep polling after a model appears because idle unloads do not update the store.
 const CATALOG_IDLE_MS = 60000;
 
-function readUseTunnelPref(): boolean {
-  if (typeof window === "undefined") return true;
-  try {
-    return window.localStorage.getItem(USE_TUNNEL_KEY) !== "false";
-  } catch {
-    return true;
-  }
+/** The Secure HTTPS switch, shared by every example card on the tab. */
+export function useApiTunnelPref(): [boolean, (next: boolean) => void] {
+  const useTunnel = useSyncExternalStore(
+    subscribeUseTunnelPref,
+    readUseTunnelPref,
+    () => true,
+  );
+  return [useTunnel, writeUseTunnelPref];
 }
 
-function writeUseTunnelPref(value: boolean): void {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(USE_TUNNEL_KEY, value ? "true" : "false");
-  } catch {
-    // Non-fatal
-  }
-}
-
-// A checkpoint can be an on-disk load path, which /v1 never advertises. Mirrors _looks_like_path.
+// match the backend path heuristic because /v1 never advertises on-disk checkpoints.
 function looksLikePath(id: string): boolean {
   return (
     id.startsWith("/") ||
@@ -407,7 +426,7 @@ function looksLikePath(id: string): boolean {
   );
 }
 
-// The model the examples name: always an id /v1 resolves against, null when there is none.
+// return only model ids that /v1 can resolve, or null when none are available.
 function useExampleModelName(keylessOnly: boolean): string | null {
   const checkpoint = useChatRuntimeStore((s) => s.params.checkpoint);
   const ggufVariant = useChatRuntimeStore((s) => s.activeGgufVariant);
@@ -521,7 +540,7 @@ const SHIKI_THEMES = [unslothLightTheme, unslothDarkTheme] as [
 ];
 const codePlugin = createCodePlugin({ themes: SHIKI_THEMES });
 
-function HighlightedCode({
+export function HighlightedCode({
   code,
   language,
   redactFromReload,
@@ -553,11 +572,15 @@ function HighlightedCode({
 
 export function UsageExamples({
   apiKey,
+  useTunnel,
+  onUseTunnelChange,
   keylessScope = "off",
   keylessTools = false,
   keylessExposure = null,
 }: {
   apiKey?: string | null;
+  useTunnel: boolean;
+  onUseTunnelChange: (next: boolean) => void;
   /** which routes keyless api access serves, so a placeholder is only used where it works */
   keylessScope?: KeylessApiAccessScope;
   /** whether a keyless caller may drive the server-side tool loop */
@@ -609,7 +632,6 @@ export function UsageExamples({
   // isGguf at the moment of a hand-made pick, null if there has been none this session.
   // A manual pick is kept only until the model's GGUF-ness changes under it.
   const clickedUnderGgufRef = useRef<boolean | null>(null);
-  const [useTunnel, setUseTunnel] = useState<boolean>(readUseTunnelPref);
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const base =
     useTunnel && cloudflareUrl ? cloudflareUrl : (serverUrl ?? origin);
@@ -648,7 +670,10 @@ export function UsageExamples({
   const keylessBase =
     !(useTunnel && cloudflareUrl) &&
     keylessBaseEligible(base, keylessScope, keylessExposure);
-  const model = useExampleModelName(keylessBase && !apiKey);
+  // Only the inference scope keeps a keyless caller on the loaded model; full can switch.
+  const model = useExampleModelName(
+    keylessBase && !apiKey && keylessScope === "inference",
+  );
 
   const [statusAnswer, setStatusAnswer] = useState<{
     key: string;
@@ -714,19 +739,17 @@ export function UsageExamples({
     void fetchDeviceType({ force: true });
   }, []);
 
-  // Fetching is the only job of this effect: populate availableAgents/
-  // detectedAgents (or clear them). Which agent gets auto-picked from that
-  // list is derived separately below, so it can react to the loaded model
-  // changing too, not just a fresh fetch.
+  // Fetching is the only job of this effect: populate availableAgents/ detectedAgents (or clear
+  // them). Which agent gets auto-picked from that list is derived separately below, so it can react
+  // to the loaded model changing too, not just a fresh fetch.
   useEffect(() => {
     // Browser loopback URLs can be SSH/local forwards, so only the desktop app
     // may use backend PATH checks to mark or auto-pick local agents.
     if (!localAgentDetection) {
       setDetectedAgents([]);
-      // A previously auto-picked agent was only ever verified against the
-      // Unsloth backend's PATH, which is meaningless now that this panel no
-      // longer targets a loopback base -- don't leave it selected, but
-      // never touch a choice the user made by hand.
+      // A previously auto-picked agent was only ever verified against the Unsloth backend's PATH,
+      // which is meaningless now that this panel no longer targets a loopback base -- don't leave
+      // it selected, but never touch a choice the user made by hand.
       if (!agentPickedByUserRef.current) {
         // The effect below corrects this; isGguf read here would be a stale closure.
         setAgent(DEFAULT_AGENT);
@@ -841,11 +864,6 @@ export function UsageExamples({
     }
   };
 
-  const handleToggleTunnel = (next: boolean) => {
-    setUseTunnel(next);
-    writeUseTunnelPref(next);
-  };
-
   const handleCopyUrl = async () => {
     if (cloudflareUrl && (await copyToClipboard(cloudflareUrl))) {
       setCopiedUrl(true);
@@ -862,7 +880,7 @@ export function UsageExamples({
 
   return (
     <section className="flex min-w-0 max-w-full flex-col">
-      <h2 className="mb-2 text-sm font-semibold text-foreground">
+      <h2 className="settings-heading mb-2 text-sm font-semibold">
         {t("settings.apiKeys.usageExamples")}
       </h2>
       <div className="min-w-0 max-w-full overflow-hidden rounded-lg border border-border bg-muted/20">
@@ -873,33 +891,36 @@ export function UsageExamples({
               <Switch
                 size="sm"
                 checked={useTunnel}
-                onCheckedChange={handleToggleTunnel}
+                onCheckedChange={onUseTunnelChange}
                 aria-label={t("settings.apiKeys.secureHttps")}
               />
               <span className="text-ui-11 font-medium text-foreground">
                 {t("settings.apiKeys.secureHttps")}
+                {/* Only when not launched with --secure: the raw 0.0.0.0 port is
+                    still globally reachable, so point the user at --secure. */}
+                {secure ? null : (
+                  <Tooltip>
+                    <TooltipTrigger asChild={true}>
+                      {/* Inline on the baseline, like a glyph after the label. */}
+                      <button
+                        type="button"
+                        className="ml-1.5 inline-flex align-baseline rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        aria-label={t("settings.apiKeys.secureHttpsHint")}
+                      >
+                        {/* Follows the UI font size, like the SettingsRow hint
+                            this matches. */}
+                        <HugeiconsIcon
+                          icon={InformationCircleIcon}
+                          className="size-[var(--ui-icon-size-hint)]"
+                        />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-[calc(260px*var(--ui-space-scale,1))] text-ui-11 leading-snug">
+                      {t("settings.apiKeys.secureHttpsHint")}
+                    </TooltipContent>
+                  </Tooltip>
+                )}
               </span>
-              {/* Only when not launched with --secure: the raw 0.0.0.0 port is
-                  still globally reachable, so point the user at --secure. */}
-              {secure ? null : (
-                <Tooltip>
-                  <TooltipTrigger asChild={true}>
-                    <button
-                      type="button"
-                      className="flex items-center rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                      aria-label={t("settings.apiKeys.secureHttpsHint")}
-                    >
-                      <HugeiconsIcon
-                        icon={InformationCircleIcon}
-                        className="size-3.5"
-                      />
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent className="max-w-[260px] text-ui-11 leading-snug">
-                    {t("settings.apiKeys.secureHttpsHint")}
-                  </TooltipContent>
-                </Tooltip>
-              )}
             </div>
             <button
               type="button"
@@ -1077,6 +1098,11 @@ export function UsageExamples({
               />
             </button>
           </div>
+          {agent === "vscode" && (
+            <span className="text-ui-11 leading-snug text-muted-foreground">
+              {t("settings.agents.vscodeNote")}
+            </span>
+          )}
           <span className="text-ui-11 leading-snug text-muted-foreground">
             {detectedAgents.length > 0
               ? t("settings.apiKeys.codingAgentsDetectedHint", {

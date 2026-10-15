@@ -44,8 +44,9 @@ OPENAI_CODEX_API_BASE = "https://chatgpt.com/backend-api"
 OPENAI_CODEX_RESPONSES_URL = f"{OPENAI_CODEX_API_BASE}/codex/responses"
 OPENAI_CODEX_MODELS_URL = f"{OPENAI_CODEX_API_BASE}/codex/models"
 OPENAI_CODEX_USER_AGENT = "unsloth-studio/1"
-# /codex/models hides any slug whose minimal_client_version exceeds this.
-OPENAI_CODEX_CLIENT_VERSION = "0.156.0"
+# Model discovery is client-version dependent, even beyond minimal_client_version.
+# Live catalog checks with 0.162.1 include gpt-6.1-sol; 0.156.0 omits it.
+OPENAI_CODEX_CLIENT_VERSION = "0.162.1"
 OPENAI_CODEX_COMPATIBILITY_INSTRUCTIONS = (
     "You are operating inside Unsloth Studio. Follow the user's instructions, "
     "use only tools supplied in this request, and return concise, accurate results."
@@ -896,9 +897,8 @@ async def resolve_access(
                 raise CodexAuthError("ChatGPT connection was disconnected during refresh.")
             if current.get("refresh_token") != previous_refresh_token:
                 return current["access_token"], current["account_id"]
-            # a refresh rotates credentials without rebinding the connection
-            # A refresh rotates credentials, it does not rebind the connection, so the record of which account the saved
-            # models were proven for carries over. _validate_token_payload only knows about the token fields.
+            # A refresh rotates credentials, it does not rebind the connection, so the record of which account the
+            # saved models were proven for carries over. _validate_token_payload only knows about the token fields.
             proof = current.get("catalog_account_id")
             if proof is not None and refreshed.get("account_id") == current.get("account_id"):
                 refreshed["catalog_account_id"] = proof
